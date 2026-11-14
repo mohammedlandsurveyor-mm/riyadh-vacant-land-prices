@@ -1,0 +1,125 @@
+# Cell 1: الإعدادات
+# ====================
+import sqlite3
+import pandas as pd
+import numpy as np
+
+DB = r"real_estate_dw.db"
+con = sqlite3.connect(DB)
+
+# Cell 2: تحميل البيانات
+# ====================
+v = pd.read_sql("SELECT * FROM v_final_land_riyadh", con)
+print(f"الحجم: {len(v)} | الشرائح: {v.use_final.value_counts().to_dict()}")
+
+# Cell 3: وسيط سعر المتر حسب القطاع
+# ====================
+res = v[v.use_final == 'سكني']
+
+print("\n=== وسيط سعر المتر السكني حسب القطاع ===")
+medians = res.groupby('direction').ppsm.agg(
+    n='count',
+    median='median',
+    q1=lambda s: s.quantile(.25),
+    q3=lambda s: s.quantile(.75)
+).round(0).sort_values('median', ascending=False)
+print(medians.to_string())
+
+# Cell 4: هيمنة حي الخير على الشمال
+# ====================
+print("\n=== هيمنة حي الخير على الشمال ===")
+north = res[res.direction == 'شمال']
+hood_medians = north.groupby('hood_true').ppsm.agg(
+    n='count',
+    median='median'
+).round(0).sort_values('n', ascending=False)
+print(hood_medians.to_string())
+
+print(f"\nالشمال الكامل: {round(north.ppsm.median(), 0)}")
+print(f"الشمال بدون الخير: {round(north[north.hood_true != 'الخير'].ppsm.median(), 0)}")
+
+# Cell 5: مصفوفة قطاع × شريحة مساحة
+# ====================
+print("\n=== قطاع × شريحة مساحة ===")
+pivot = res.pivot_table(
+    index='direction',
+    columns='size_band',
+    values='ppsm',
+    aggfunc=['count', 'median']
+).round(0)
+print(pivot.to_string())
+
+# Cell 6: مقارنة سكني/تجاري
+# ====================
+print("\n=== مقارنة سكني/تجاري داخل نفس القطاع ===")
+comp = v.pivot_table(
+    index='direction',
+    columns='use_final',
+    values='ppsm',
+    aggfunc=['count', 'median']
+)
+print(comp.round(0).to_string())
+
+# Cell 7: محرك الفرص الهرمي
+# ====================
+print("\n=== محرك الفرص الهرمي ===")
+
+# Benchmark الحي (n>=10)
+hood_b = res.groupby('hood_true').ppsm.agg(
+    n_h='count',
+    hood_med='median'
+)
+hood_b = hood_b[hood_b.n_h >= 10]
+
+# Benchmark القطاع×الشريحة (n>=10)
+sb_b = res.groupby(['direction', 'size_band']).ppsm.agg(
+    n_sb='count',
+    sb_med='median'
+).reset_index()
+sb_b = sb_b[sb_b.n_sb >= 10]
+
+# الدمج
+m = (res.merge(hood_b[['hood_med']], on='hood_true', how='left')
+        .merge(sb_b[['direction', 'size_band', 'sb_med']],
+               on=['direction', 'size_band'], how='left'))
+
+m['bench'] = m.hood_med.fillna(m.sb_med)
+m['bench_level'] = m.hood_med.notna().map({True: 'حي', False: 'قطاع×شريحة'})
+m = m.dropna(subset=['bench']).copy()
+m['dev_pct'] = (((m.ppsm - m.bench) / m.bench) * 100).round(1)
+
+# الثقة
+m['confidence'] = 'عالية'
+m.loc[(m.desc_sparse == 1) | (m.price_mismatch == 1), 'confidence'] = 'منخفضة'
+
+# الفرص عالية الثقة
+opp = m[(m.dev_pct <= -25) & (m.confidence == 'عالية')].nsmallest(10, 'dev_pct')
+print(f"\nعدد الفرص عالية الثقة: {len(opp)} من {len(m)}")
+print(opp[['id', 'hood_true', 'direction', 'ppsm', 'bench', 'dev_pct']].to_string(index=False))
+
+# Cell 8: خريطة الأحياء
+# ====================
+print("\n=== الأحياء الأرخص نسبيًا ===")
+hoods = res.groupby(['direction', 'hood_true']).ppsm.agg(
+    n='count',
+    median_ppsm='median'
+).reset_index()
+hoods = hoods[hoods.n >= 2].copy()
+
+sec = res.groupby('direction').ppsm.median()
+hoods['sector_med'] = hoods.direction.map(sec).round(0)
+hoods['vs_sector_pct'] = ((((hoods.median_ppsm - hoods.sector_med)
+                            / hoods.sector_med) * 100)).round(0)
+
+print(hoods.sort_values('vs_sector_pct').head(12).to_string(index=False))
+
+# Cell 9: حفظ المخرجات
+# ====================
+medians.reset_index().to_csv('data/benchmark_table.csv', index=False, encoding='utf-8-sig')
+opp.to_csv('data/opportunities.csv', index=False, encoding='utf-8-sig')
+hoods.round(0).to_csv('data/neighborhoods.csv', index=False, encoding='utf-8-sig')
+m.to_csv('data/deviation_table.csv', index=False, encoding='utf-8-sig')
+
+print("\n✅")
+
+con.close()
