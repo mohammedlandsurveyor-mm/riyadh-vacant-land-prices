@@ -1,0 +1,247 @@
+# -*- coding: utf-8 -*-
+"""
+clean_riyadh_land.py
+====================
+خط تنظيف بيانات الأراضي الفضاء في الرياض
+من 308 إعلان خام إلى ~183 إعلان صالح للتحليل
+
+المنهجية: Ask → Prepare → Process → Analyze → Share → Act
+المصدر: منصة عقار (sa.aqar.fm)
+التاريخ: 2025-2026
+"""
+
+import sqlite3
+import re
+import pandas as pd
+from pathlib import Path
+from urllib.parse import unquote
+
+# ==================== الإعدادات ====================
+DB_PATH = Path(r"real_estate_dw.db")
+OUTPUT_DIR = Path("data")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# ==================== دوال مساعدة ====================
+
+# تحويل الأرقام العربية/الهندية إلى لاتينية
+AR_MAP = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
+
+
+def clean_number(s):
+    """
+    استخراج رقم من نص مع معالجة:
+    - الفاصلة العربية (،) واللاتينية (,)
+    - الأرقام الهندية (٠-٩)
+    - الفاصل العربي (٬)
+    """
+    if s is None or pd.isna(s):
+        return None
+    s = str(s).translate(AR_MAP)
+    s = s.replace(',', '').replace('،', '').replace('٬', '')
+    m = re.search(r'\d+(?:\.\d+)?', s)
+    return float(m.group()) if m else None
+
+
+def extract_field(details, label):
+    """استخراج حقل من details_list مثل: 'المساحة 500م²'"""
+    if pd.isna(details):
+        return None
+    for part in str(details).split('|'):
+        if part.strip().startswith(label):
+            return part.strip()[len(label):].strip()
+    return None
+
+
+# ==================== 1. تحميل البيانات من قاعدة البيانات ====================
+print("📥 جاري الاتصال بقاعدة البيانات...")
+con = sqlite3.connect(DB_PATH)
+tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+print(f"   الجداول الموجودة: {tables}")
+
+# اختيار جدول المصدر
+SRC = None
+for t in ['work_land_riyadh', 'real_estate_ads']:
+    if t in tables:
+        SRC = t
+        break
+
+if SRC is None:
+    raise SystemExit("❌ لم أجد جدول المصدر (work_land_riyadh أو real_estate_ads)")
+
+print(f"   المصدر: {SRC}")
+raw = pd.read_sql(f"SELECT * FROM [{SRC}]", con)
+print(f"   إجمالي الصفوف: {len(raw)}")
+
+# ==================== 2. الفلترة الأولية ====================
+print("\n🔍 الفلترة الأولية...")
+work = raw[
+    (raw.property_type == 'أرض') &
+    (raw.ad_type == 'للبيع') &
+    (raw.city == 'الرياض')
+].copy()
+print(f"   بعد الفلترة (أراضي للبيع في الرياض): {len(work)}")
+
+# ==================== 3. الاشتقاقات الأساسية ====================
+print("\n⚙️  الاشتقاقات الأساسية...")
+
+# 3.1 الحقول الرقمية من details_list
+work['area_fixed'] = work.details_list.apply(lambda d: clean_number(extract_field(d, 'المساحة')))
+work['ppsm_listed'] = work.details_list.apply(lambda d: clean_number(extract_field(d, 'سعر المتر')))
+work['street_width'] = work.details_list.apply(lambda d: clean_number(extract_field(d, 'عرض الشارع')))
+work['frontage'] = work.details_list.apply(lambda d: extract_field(d, 'الواجهة'))
+work['use_detail'] = work.details_list.apply(lambda d: extract_field(d, 'نوع العقار'))
+
+# 3.2 الموقع من العنوان والرابط
+work['city_true'] = work.title.str.extract(r'مدينة\s+([^,]+?)\s*,\s*منطقة')[0]
+work['hood_true'] = work.title.str.extract(r'حي\s+([^,]+?)\s*,\s*مدينة')[0]
+
+url = work.ad_url.apply(unquote)
+work['direction'] = url.str.extract(r'/(شمال|جنوب|شرق|غرب|وسط)-الرياض/')[0]
+work['aqar_id'] = url.str.extract(r'-(\d+)/?$')[0]
+
+# الحي البديل من الرابط
+mask = work.hood_true.isna()
+work.loc[mask, 'hood_true'] = url[mask].str.extract(r'حي-(.+?)[-/]مدينة-')[0].str.replace('-', ' ')
+
+# 3.3 السعر
+work['ppsm_calc'] = work.price / work.area_fixed
+work['ppsm'] = work.ppsm_listed.fillna(work.ppsm_calc)
+work['price_clean'] = (work.area_fixed * work.ppsm).round(0)
+
+# 3.4 أعلام التعارض
+work['price_mismatch'] = (
+    work.ppsm_listed.notna() &
+    ((work.ppsm_calc - work.ppsm_listed).abs() / work.ppsm_listed > 0.02)
+).astype(int)
+
+work['area_was_wrong'] = ((work.area_sqm - work.area_fixed).abs() > 1).astype(int)
+
+# 3.5 الأعلام النصية
+d = work.description.fillna('')
+
+work['is_built'] = d.str.contains(
+    r'مبني عليها|فيلا بقيمة أرض|عليها فيلا|مبنى قائم|مقام عليه|'
+    r'الفيلا قائمة|فيلا قائمة|العمارة قائمة|'
+    r'Villa Sold as Land|Sold as Land Value', regex=True
+).astype(int)
+
+work['is_sold'] = d.str.contains(r'تم البيع|مباع', regex=True).astype(int)
+work['is_agri'] = d.str.contains(r'زراعي|زراعية|مزرعة', regex=True).astype(int)
+
+work['is_multi'] = d.str.contains(
+    r'راس بلك|رأس بلك|قطعتين|أرضين|ارضين|للبيع للقطعة|بلك سكني',
+    regex=True
+).astype(int)
+
+work['is_som'] = d.str.contains(r'على السوم|السوم', regex=True).astype(int)
+work['no_text'] = d.str.contains('لم يتم العثور').astype(int)
+
+# 3.6 تصنيف الاستخدام
+work['land_use'] = 'سكني'
+work.loc[
+    work.use_detail.fillna('').str.contains('تجاري') |
+    d.str.contains(r'تجاري|تجارية', regex=True),
+    'land_use'
+] = 'تجاري'
+work.loc[work.is_agri == 1, 'land_use'] = 'زراعي'
+
+print(f"   ✅ الاشتقاقات اكتملت")
+print(f"      - سكني: {(work.land_use == 'سكني').sum()}")
+print(f"      - تجاري: {(work.land_use == 'تجاري').sum()}")
+print(f"      - زراعي: {(work.land_use == 'زراعي').sum()}")
+
+# ==================== 4. أعمدة المراجعة اليدوية ====================
+print("\n📝 إضافة أعمدة المراجعة اليدوية...")
+
+work['final_use'] = None
+work['final_exclude'] = 0
+work['review_note'] = ''
+
+# 4.1 منح حكومية
+work['is_grant'] = d.str.contains(r'\bمنح\b|مخطط 3449|مخطط 2702', regex=True).astype(int)
+
+# 4.2 وصف فقير
+work['desc_sparse'] = (d.str.len() < 200).astype(int)
+
+# 4.3 موقع غير دقيق
+work['loc_unreliable'] = d.str.contains(
+    r'الموقع الاعلان غير دقيق|الموقع غير دقيق', regex=True
+).astype(int)
+
+# ==================== 5. تطبيق قرارات المراجعة اليدوية ====================
+print("\n✏️  تطبيق قرارات المراجعة اليدوية...")
+
+DECISIONS = {
+    23954: dict(
+        final_use='تجاري', hood_true='الملز', ppsm=20000,
+        review_note='حي الملز + مسموح 8 ادوار = تجاري؛ 27400000/1370=20000'
+    ),
+    24082: dict(
+        final_exclude=1,
+        review_note='المعلن: الموقع غير دقيق + 40000 للمتر مستحيل'
+    ),
+    11092: dict(
+        final_exclude=1,
+        review_note='لا سعر في النص؛ 480 للمتر اقل من منح العلا'
+    ),
+}
+
+for _id, kw in DECISIONS.items():
+    idx = work.index[work.id == _id]
+    if len(idx):
+        for k, v in kw.items():
+            work.loc[idx, k] = v
+        print(f"   ✅ قرار {_id} طُبّق")
+
+# ==================== 6. حفظ stage1 ====================
+print("\n💾 حفظ stage1_land_riyadh...")
+work.to_sql('stage1_land_riyadh', con, if_exists='replace', index=False)
+print(f"   ✅ تم حفظ {len(work)} صف")
+
+# ==================== 7. بناء الجدول النهائي v_final ====================
+print("\n🎯 بناء الجدول النهائي...")
+
+work['use_final'] = work.final_use.fillna(work.land_use)
+
+fin = work[
+    (work.city_true == 'الرياض') &
+    (work.final_exclude == 0) &
+    (work.is_built == 0) &
+    (work.is_sold == 0) &
+    (work.is_multi == 0) &
+    (work.ppsm > 0) &
+    (work.area_fixed <= 5000) &
+    (work.loc_unreliable == 0) &
+    (work.use_final.isin(['سكني', 'تجاري']))
+].copy()
+
+fin['size_band'] = pd.cut(
+    fin.area_fixed,
+    bins=[0, 400, 700, 5000],
+    labels=['صغيرة', 'متوسطة', 'كبيرة']
+)
+
+fin.to_sql('v_final_land_riyadh', con, if_exists='replace', index=False)
+fin.to_csv(OUTPUT_DIR / 'v_final_land_riyadh.csv', index=False, encoding='utf-8-sig')
+con.commit()
+
+print(f"   ✅ v_final_land_riyadh: {len(fin)} صف")
+print(f"      - سكني: {(fin.use_final == 'سكني').sum()}")
+print(f"      - تجاري: {(fin.use_final == 'تجاري').sum()}")
+
+# ==================== 8. تقرير ختامي ====================
+print("\n" + "="*60)
+print("📊 تقرير ختامي")
+print("="*60)
+print(f"إجمالي الإعلانات الخام: {len(raw)}")
+print(f"بعد الفلترة الأولية: {len(work)}")
+print(f"العينة النهائية (v_final): {len(fin)}")
+print(f"معدل التنقية: {100*(1 - len(fin)/len(raw)):.1f}%")
+print(f"\nأعلام الجودة:")
+print(f"   - منح حكومية: {fin.is_grant.sum()}")
+print(f"   - وصف فقير: {fin.desc_sparse.sum()}")
+print(f"   - موقع غير دقيق: {fin.loc_unreliable.sum()}")
+print(f"\n✅ اكتمل التنظيف بنجاح!")
+print(f"📁 المخرجات: {OUTPUT_DIR}")
+
+con.close()
